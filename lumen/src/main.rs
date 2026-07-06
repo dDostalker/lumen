@@ -43,7 +43,6 @@ fn ensure_lumina_tls_disabled() {
     if !needs_change {
         return;
     }
-    let is_add = current.is_none();
 
     // Update the current process env as well.
     std::env::set_var("LUMINA_TLS", "false");
