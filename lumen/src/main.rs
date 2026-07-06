@@ -48,8 +48,6 @@ fn ensure_lumina_tls_disabled() {
     // Update the current process env as well.
     std::env::set_var("LUMINA_TLS", "false");
 
-    let action = if is_add { "Add" } else { "Change" };
-
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
         match persist_lumina_tls_user_env() {
