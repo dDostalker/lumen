@@ -1,5 +1,7 @@
 # Lumen
 
+> This repository is a fork of naim94a/lumen; it primarily replaces dependencies like PostgreSQL with Turso (SQLite) to make it more lightweight and easier to use. Please support the original author.
+
 A private Lumina server that can be used with IDA Pro 7.2+.
 
 [lumen.abda.nl](https://lumen.abda.nl/) runs this server.
@@ -9,7 +11,7 @@ You can read about the protocol research [here](https://abda.nl/posts/introducin
 ## Features
 
 - Stores function signatures so you (and your team) can quickly identify functions that you found in the past using IDA's built-in Lumina features.
-- Backed by PostgreSQL
+- Backed by Turso (libSQL/SQLite-compatible) — a single embedded database file. No external database server, no setup, no migrations; the schema is initialized automatically on first run.
 - Experimental HTTP API that allows querying the database for comments by file or function hash.
 
 ## Getting Started
@@ -26,22 +28,14 @@ In this method precompiled docker images will be downloaded, All you need is [do
 
 ### Building from source with Rust
 
-1. `git clone https://github.com/naim94a/lumen.git`
+1. `git clone https://github.com/dDostalker/lumen.git`
 2. Get a rust toolchain: https://rustup.rs/
 3. `cd lumen`
-4. Setup a the database
+4. `cargo build --release`
 
-   - install postgres
-   - install diesel-cli and run migrations:
-
-     ```bash
-     cargo install diesel_cli --no-default-features -Fpostgres
-     diesel --config-file common/diesel.toml \
-        --database-url postgres://postgres:password@localhost/lumen \
-        migration run
-     ```
-
-5. `cargo build --release`
+No database setup is required: lumen stores everything in a single Turso
+(`.db`) file configured via `[database] path` in your `config.toml`. The file,
+parent directories, and schema are created automatically on first run.
 
 ### Usage
 
@@ -122,4 +116,6 @@ Instead, the metadata with the highest calculated score is returned to the user.
 
 ---
 
-Developed by [Naim A.](https://github.com/naim94a); License: MIT.
+Developed by [Naim A.](https://github.com/naim94a);
+Forked by [dDostalker](https://github.com/dDostalker)
+License: MIT.
