@@ -5,3 +5,5 @@ private/
 *.p12
 *.crt
 config.toml
+lumen.db
+lumen.db-wal
