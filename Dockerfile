@@ -1,10 +1,7 @@
 FROM rust:1.93.1-slim-bookworm
 ARG	DEBIAN_FRONTEND=noninteractive
-RUN	apt-get update && apt-get install -y --no-install-recommends --no-install-suggests ca-certificates pkg-config libssl-dev libpq-dev
+RUN	apt-get update && apt-get install -y --no-install-recommends --no-install-suggests ca-certificates pkg-config libssl-dev
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
-
-RUN --mount=type=cache,target=$CARGO_HOME/registry \
-    cargo install diesel_cli --version 2.2.10 --no-default-features --features postgres
 
 COPY	common	/lumen/common
 COPY	lumen	/lumen/lumen
@@ -14,13 +11,10 @@ RUN --mount=type=cache,target=$CARGO_HOME/registry,target=/lumen/target \
 
 FROM	debian:bookworm-slim
 ARG	DEBIAN_FRONTEND=noninteractive
-RUN	apt-get update && apt-get install -y --no-install-recommends --no-install-suggests openssl libpq5 && \
+RUN	apt-get update && apt-get install -y --no-install-recommends --no-install-suggests openssl && \
     sed -i -e 's,\[ v3_req \],\[ v3_req \]\nextendedKeyUsage = serverAuth,' /etc/ssl/openssl.cnf
-RUN mkdir /usr/lib/lumen/
+RUN mkdir -p /usr/lib/lumen/
 
-COPY 	--from=0	/usr/local/cargo/bin/diesel  /usr/bin/diesel
-COPY 	--from=0	/lumen/common/migrations  /usr/lib/lumen/migrations
-COPY 	--from=0	/lumen/common/diesel.toml  /usr/lib/lumen/
 COPY	--from=0	/root/lumen	/usr/bin/lumen
 
 COPY	config-example.toml	docker-init.sh	/lumen/

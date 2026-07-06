@@ -1,37 +1,33 @@
 #!/bin/sh
 CFGPATH="/dockershare"
-KEYPATH="/lumen/lumen.p12"
+DBPATH="/data/lumen.db"
 die(){
     echo "Exiting due to error: $@" && exit 1
 }
-do_config_fixup(){
-           sed -i -e "s,connection_info.*,connection_info = \"${DATABASE_URL}\"," \
-	   /lumen/config.toml
-}
 use_default_config(){
     echo "No custom config.toml found, creating secure default."
+    mkdir -p "$(dirname "$DBPATH")"
     tee /lumen/config.toml <<- EOF > /dev/null
 	[lumina]
 	bind_addr = "0.0.0.0:1234"
 	use_tls = true
 	server_name = "lumen"
 	[lumina.tls]
-	server_cert = "${KEYPATH}"
+	server_cert = "/lumen/lumen.p12"
 	[database]
-	connection_info = "host=db port=5432 user=lumina password=1"
-	use_tls = false
+	path = "${DBPATH}"
 	[api_server]
 	bind_addr = "0.0.0.0:8082"
 	EOF
 }
 use_default_key(){
+    KEYPATH="/lumen/lumen.p12"
     openssl req -x509 -newkey rsa:4096 -keyout /lumen/lumen_key.pem -out /lumen/lumen_crt.pem -days 365 -nodes \
 	    --subj "/C=US/ST=Texas/L=Austin/O=Lumina/OU=Naimd/CN=lumen" -passout "pass:" -extensions v3_req || die "Generating key"
-    openssl pkcs12 -export -out /lumen/lumen.p12 -inkey /lumen/lumen_key.pem -in /lumen/lumen_crt.pem  \
+    openssl pkcs12 -export -out "${KEYPATH}" -inkey /lumen/lumen_key.pem -in /lumen/lumen_crt.pem  \
 	    -passin "pass:" -passout "pass:" || die "Exporting key"
     openssl x509 -in /lumen/lumen_crt.pem -out $CFGPATH/hexrays.crt -passin "pass:" || die "Exporting hexrays.crt"
     echo "hexrays.crt added to mounted volume.  Copy this to your IDA install dir." ;
-    sed -i -e "s,server_cert.*,server_cert = \"${KEYPATH}\"," /lumen/config.toml ;
 }
 setup_tls_key(){
     PRIVKEY=$(find $CFGPATH -type f \( -name '*.p12' -o -name '*.pfx' \) | head -1)
@@ -47,6 +43,7 @@ setup_tls_key(){
     else
         echo "No custom TLS key with p12/pfx extension in the custom mount directory." ;
 	use_default_key ;
+        sed -i -e "s,server_cert.*,server_cert = \"/lumen/lumen.p12\"," /lumen/config.toml ;
     fi ;
 }
 setup_config(){
@@ -61,12 +58,13 @@ setup_config(){
     else
 	use_default_config ;
 	setup_tls_key ;
-    fi        
+    fi
+    # ensure the configured database file's directory exists
+    DBDIR=$(grep -E '^\s*path' /lumen/config.toml | head -1 | sed -E 's,.*=\s*"([^"]+)".*,\1,' | xargs dirname 2>/dev/null || true)
+    if [ -n "$DBDIR" ] ; then mkdir -p "$DBDIR" ; fi
 }
 
+mkdir -p /data
 setup_config ;
-do_config_fixup ;
-echo Running DB migrations...
-diesel --config-file /usr/lib/lumen/diesel.toml migration run
-echo Migrations done.
+echo "Starting lumen. The Turso database file is initialized automatically on first run."
 exec lumen -c /lumen/config.toml

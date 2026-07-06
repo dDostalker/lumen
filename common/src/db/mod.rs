@@ -1,27 +1,18 @@
-use crate::async_drop::{AsyncDropGuard, AsyncDropper};
 use log::*;
-use postgres_native_tls::MakeTlsConnector;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
-use tokio_postgres::{tls::MakeTlsConnect, NoTls, Socket};
+use turso::{params_from_iter, Builder, Connection, Value};
+
 pub mod schema;
-mod schema_auto;
 
-use diesel::{
-    query_builder::{Query, QueryFragment},
-    sql_types::{Array, Binary, Integer, VarChar},
-    upsert::excluded,
-    ExpressionMethods, NullableExpressionMethods, QueryDsl,
-};
-use diesel_async::{pooled_connection::ManagerConfig, RunQueryDsl};
-
-pub type DynConfig = dyn crate::config::HasConfig + Send + Sync;
+/// Maximum number of host parameters per statement. SQLite-compatible engines
+/// usually cap this around 999 / 32766. We pick a conservative value that fits
+/// the per-row column count used in bulk inserts.
+const SQLITE_MAX_VARS: usize = 900;
 
 pub struct Database {
-    tls_connector: Option<MakeTlsConnector>,
-    diesel: diesel_async::pooled_connection::bb8::Pool<diesel_async::AsyncPgConnection>,
-    dropper: AsyncDropper,
+    conn: Connection,
 }
 
 pub struct FunctionInfo {
@@ -43,95 +34,29 @@ pub struct DbStats {
     unique_files: i32,
 }
 
+const SCHEMA_SQL: &str = include_str!("schema.sql");
+
 impl Database {
     pub async fn open(config: &crate::config::Database) -> Result<Self, anyhow::Error> {
-        let connection_string = config.connection_info.as_str();
-        let tls_connector = if config.use_tls { Some(Self::make_tls(config).await) } else { None };
-
-        let (dropper, worker) = AsyncDropper::new();
-        tokio::task::spawn(worker);
-
-        let diesel = Self::make_bb8_pool(connection_string, tls_connector.clone()).await?;
-
-        Ok(Database { tls_connector, dropper, diesel })
-    }
-
-    async fn make_pg_client<T>(
-        db_url: &str, tls: T,
-    ) -> diesel::result::ConnectionResult<diesel_async::AsyncPgConnection>
-    where
-        T: MakeTlsConnect<Socket>,
-        T::Stream: Send + 'static,
-    {
-        let (cli, conn) = tokio_postgres::connect(db_url, tls).await.map_err(|e| {
-            error!("failed to connect db: {e}");
-            diesel::result::ConnectionError::BadConnection(format!("{e}"))
-        })?;
-
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                error!("connection task error: {e}");
+        // Make sure the parent directory exists so we can create the file.
+        if let Some(parent) = config.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await.ok();
             }
-        });
-
-        diesel_async::AsyncPgConnection::try_from(cli).await
-    }
-
-    async fn make_bb8_pool(
-        db_url: &str, tls: Option<MakeTlsConnector>,
-    ) -> Result<
-        diesel_async::pooled_connection::bb8::Pool<diesel_async::AsyncPgConnection>,
-        anyhow::Error,
-    > {
-        let mut config = ManagerConfig::default();
-        config.custom_setup = Box::new(move |db_url| {
-            let tls = tls.clone();
-            Box::pin(async move {
-                if let Some(tls) = tls {
-                    Self::make_pg_client(db_url, tls).await
-                } else {
-                    Self::make_pg_client(db_url, NoTls).await
-                }
-            })
-        });
-        let cfg = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-            diesel_async::AsyncPgConnection,
-        >::new_with_config(db_url, config);
-
-        let pool = diesel_async::pooled_connection::bb8::Pool::builder()
-            .min_idle(Some(1))
-            .build(cfg)
-            .await?;
-        Ok(pool)
-    }
-
-    async fn make_tls(database: &crate::config::Database) -> MakeTlsConnector {
-        use native_tls::{Certificate, Identity, TlsConnector};
-
-        let mut tls_connector = TlsConnector::builder();
-
-        if let Some(ref client_identity) = database.client_id {
-            let client_identity =
-                tokio::fs::read(client_identity).await.expect("failed to read db's client id");
-            let client_identity = Identity::from_pkcs12(&client_identity, "")
-                .expect("failed to load db's client identity (PKCS12)");
-            tls_connector.identity(client_identity);
         }
 
-        if let Some(ref server_ca) = database.server_ca {
-            let server_ca =
-                tokio::fs::read(server_ca).await.expect("failed to read db's server ca");
-            let server_ca =
-                Certificate::from_pem(&server_ca).expect("failed to load db's server ca (PEM)");
-            tls_connector.add_root_certificate(server_ca);
-        }
+        let path = config.path.to_string_lossy().into_owned();
+        info!("opening turso database at {:?}", config.path);
+        let db = Builder::new_local(&path).build().await?;
+        let conn = db.connect()?;
 
-        let tls_connector = tls_connector
-            .danger_accept_invalid_hostnames(true)
-            .build()
-            .expect("failed to build TlsConnector");
+        // Apply the schema. This is idempotent (`CREATE TABLE IF NOT EXISTS`).
+        conn.execute_batch(SCHEMA_SQL).await?;
 
-        MakeTlsConnector::new(tls_connector)
+        // Enable WAL for better concurrency on supporting builds.
+        let _ = conn.pragma_update("journal_mode", "WAL").await;
+
+        Ok(Database { conn })
     }
 
     pub async fn get_funcs(
@@ -139,27 +64,52 @@ impl Database {
     ) -> Result<Vec<Option<FunctionInfo>>, anyhow::Error> {
         let chksums: Vec<&[u8]> = funcs.iter().map(|v| v.mb_hash).collect();
 
-        let rows: Vec<(String, i32, Vec<u8>, Vec<u8>)> = {
-            let conn = &mut self.diesel.get().await?;
+        let mut partial: HashMap<Vec<u8>, FunctionInfo> = HashMap::new();
 
-            let ct = self.cancel_guard(&*conn);
+        // SQLite has no `ANY($array)`; emulate by chunking `IN (?, ?, ...)` queries.
+        for chunk in chksums.chunks(SQLITE_MAX_VARS) {
+            let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "WITH best AS (
+                    SELECT chksum, MAX(rank) AS maxrank FROM funcs
+                    WHERE chksum IN ({placeholders})
+                    GROUP BY chksum
+                )
+                SELECT f2.name, f2.len, f2.metadata, f2.chksum
+                FROM best
+                LEFT JOIN funcs f2 ON (best.chksum = f2.chksum AND best.maxrank = f2.rank)"
+            );
 
-            let res: Vec<_> = BestMds(chksums.as_slice()).get_results::<_>(conn).await?;
-            ct.consume();
-            res
-        };
+            let params: Vec<Value> = chunk.iter().map(|c| Value::Blob(c.to_vec())).collect();
+            let mut rows = self.conn.query(&sql, params_from_iter(params.into_iter())).await?;
 
-        let mut partial: HashMap<Vec<u8>, FunctionInfo> = rows
-            .into_iter()
-            .map(|row| {
-                let v = FunctionInfo { name: row.0, len: row.1 as u32, data: row.2, popularity: 0 };
+            while let Some(row) = rows.next().await? {
+                let name = match row.get_value(0)? {
+                    Value::Text(s) => s,
+                    Value::Blob(b) => String::from_utf8_lossy(&b).into_owned(),
+                    _ => String::new(),
+                };
+                let len = match row.get_value(1)? {
+                    Value::Integer(i) => i as u32,
+                    _ => 0,
+                };
+                let metadata = match row.get_value(2)? {
+                    Value::Blob(b) => b,
+                    _ => Vec::new(),
+                };
+                let chksum = match row.get_value(3)? {
+                    Value::Blob(b) => b,
+                    _ => continue,
+                };
 
-                (row.3, v)
-            })
-            .collect();
+                partial.insert(
+                    chksum,
+                    FunctionInfo { name, len, data: metadata, popularity: 0 },
+                );
+            }
+        }
 
         let results = partial.len();
-
         let res: Vec<Option<FunctionInfo>> =
             chksums.iter().map(|&chksum| partial.remove(chksum)).collect();
 
@@ -171,191 +121,264 @@ impl Database {
     pub async fn get_or_create_user<'a>(
         &self, user: &'a crate::rpc::RpcHello<'a>, hostname: &str,
     ) -> Result<i32, anyhow::Error> {
-        use schema::users;
-
-        let conn = &mut self.diesel.get().await?;
-
-        let lic_id = &user.lic_number[..];
+        let lic_id = user.lic_number;
         let lic_data = user.license_data;
 
-        let get_user = || {
-            users::table
-                .select(users::id)
-                .filter(users::lic_data.eq(lic_data))
-                .filter(users::lic_id.eq(lic_id))
-                .filter(users::hostname.eq(hostname))
-        };
+        let row = self
+            .conn
+            .query(
+                "SELECT id FROM users WHERE lic_id = ? AND lic_data = ? AND hostname = ?",
+                params_from_iter(
+                    [
+                        Value::Blob(lic_id.to_vec()),
+                        Value::Blob(lic_data.to_vec()),
+                        Value::Text(hostname.to_string()),
+                    ]
+                    .into_iter(),
+                ),
+            )
+            .await?
+            .next()
+            .await?;
 
-        match get_user().get_result::<i32>(conn).await {
-            Ok(v) => return Ok(v),
-            Err(err) if err != diesel::result::Error::NotFound => return Err(err.into()),
-            _ => {},
-        };
-
-        match diesel::insert_into(users::table)
-            .values(vec![(
-                users::lic_id.eq(lic_id),
-                users::lic_data.eq(lic_data),
-                users::hostname.eq(hostname),
-            )])
-            .returning(users::id) // xmax = 0 if the row is new
-            .get_result::<i32>(conn)
-            .await
-        {
-            Ok(v) => return Ok(v),
-            Err(diesel::result::Error::DatabaseError(
-                diesel::result::DatabaseErrorKind::UniqueViolation,
-                _,
-            )) => {},
-            Err(e) => return Err(e.into()),
+        if let Some(row) = row {
+            if let Value::Integer(id) = row.get_value(0)? {
+                return Ok(id as i32);
+            }
         }
 
-        Ok(get_user().get_result::<i32>(conn).await?)
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO users (lic_id, lic_data, hostname) VALUES (?, ?, ?)",
+                params_from_iter(
+                    [
+                        Value::Blob(lic_id.to_vec()),
+                        Value::Blob(lic_data.to_vec()),
+                        Value::Text(hostname.to_string()),
+                    ]
+                    .into_iter(),
+                ),
+            )
+            .await?;
+
+        let id = self
+            .conn
+            .query(
+                "SELECT id FROM users WHERE lic_id = ? AND lic_data = ? AND hostname = ?",
+                params_from_iter(
+                    [
+                        Value::Blob(lic_id.to_vec()),
+                        Value::Blob(lic_data.to_vec()),
+                        Value::Text(hostname.to_string()),
+                    ]
+                    .into_iter(),
+                ),
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("failed to create user"))?;
+
+        let id = match id.get_value(0)? {
+            Value::Integer(i) => i as i32,
+            _ => anyhow::bail!("user id has unexpected type"),
+        };
+        Ok(id)
     }
 
     async fn get_or_create_file<'a>(
         &self, funcs: &'a crate::rpc::PushMetadata<'a>,
     ) -> Result<i32, anyhow::Error> {
-        use schema::files::{chksum, id, table as files};
+        let hash = funcs.md5;
 
-        let hash = &funcs.md5[..];
+        let row = self
+            .conn
+            .query(
+                "SELECT id FROM files WHERE chksum = ?",
+                params_from_iter([Value::Blob(hash.to_vec())].into_iter()),
+            )
+            .await?
+            .next()
+            .await?;
 
-        let conn = &mut self.diesel.get().await?;
-
-        let get_file = || files.filter(chksum.eq(hash)).select(id);
-
-        match get_file().get_result::<i32>(conn).await {
-            Ok(v) => return Ok(v),
-            Err(err) if err != diesel::result::Error::NotFound => return Err(err.into()),
-            _ => {},
+        if let Some(row) = row {
+            if let Value::Integer(id) = row.get_value(0)? {
+                return Ok(id as i32);
+            }
         }
 
-        match diesel::insert_into(files)
-            .values(vec![(chksum.eq(hash),)])
-            .returning(id)
-            .get_result::<i32>(conn)
-            .await
-        {
-            Ok(v) => return Ok(v),
-            Err(diesel::result::Error::DatabaseError(
-                diesel::result::DatabaseErrorKind::UniqueViolation,
-                _,
-            )) => {},
-            Err(e) => return Err(e.into()),
-        }
-        Ok(get_file().get_result::<i32>(conn).await?)
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO files (chksum) VALUES (?)",
+                params_from_iter([Value::Blob(hash.to_vec())].into_iter()),
+            )
+            .await?;
+
+        let id = self
+            .conn
+            .query(
+                "SELECT id FROM files WHERE chksum = ?",
+                params_from_iter([Value::Blob(hash.to_vec())].into_iter()),
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("failed to create file"))?;
+
+        let id = match id.get_value(0)? {
+            Value::Integer(i) => i as i32,
+            _ => anyhow::bail!("file id has unexpected type"),
+        };
+        Ok(id)
     }
 
     async fn get_or_create_db<'a>(
         &self, user: &'a crate::rpc::RpcHello<'a>, funcs: &'a crate::rpc::PushMetadata<'a>,
     ) -> Result<i32, anyhow::Error> {
-        use schema::dbs::{
-            file_id as db_file_id, file_path, id as db_id, idb_path, table as dbs,
-            user_id as db_user,
+        let file_id = self.get_or_create_file(funcs).await?;
+        let user_id = self.get_or_create_user(user, funcs.hostname).await?;
+
+        let params = params_from_iter(
+            [
+                Value::Integer(file_id as i64),
+                Value::Integer(user_id as i64),
+                Value::Text(funcs.idb_path.to_string()),
+            ]
+            .into_iter(),
+        );
+
+        let row = self
+            .conn
+            .query(
+                "SELECT id FROM dbs WHERE file_id = ? AND user_id = ? AND idb_path = ?",
+                params,
+            )
+            .await?
+            .next()
+            .await?;
+
+        if let Some(row) = row {
+            if let Value::Integer(id) = row.get_value(0)? {
+                return Ok(id as i32);
+            }
+        }
+
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO dbs (file_id, user_id, file_path, idb_path) VALUES (?, ?, ?, ?)",
+                params_from_iter(
+                    [
+                        Value::Integer(file_id as i64),
+                        Value::Integer(user_id as i64),
+                        Value::Text(funcs.file_path.to_string()),
+                        Value::Text(funcs.idb_path.to_string()),
+                    ]
+                    .into_iter(),
+                ),
+            )
+            .await?;
+
+        let id = self
+            .conn
+            .query(
+                "SELECT id FROM dbs WHERE file_id = ? AND user_id = ? AND idb_path = ?",
+                params_from_iter(
+                    [
+                        Value::Integer(file_id as i64),
+                        Value::Integer(user_id as i64),
+                        Value::Text(funcs.idb_path.to_string()),
+                    ]
+                    .into_iter(),
+                ),
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("failed to create db"))?;
+
+        let id = match id.get_value(0)? {
+            Value::Integer(i) => i as i32,
+            _ => anyhow::bail!("db id has unexpected type"),
         };
-
-        let file_id = self.get_or_create_file(funcs);
-        let user_id = self.get_or_create_user(user, funcs.hostname);
-
-        let (file_id, user_id): (i32, i32) = futures_util::try_join!(file_id, user_id)?;
-
-        let conn = &mut self.diesel.get().await?;
-
-        let get_db = || {
-            dbs.select(db_id)
-                .filter(db_user.eq(user_id))
-                .filter(db_file_id.eq(file_id))
-                .filter(file_path.eq(funcs.file_path))
-                .filter(idb_path.eq(funcs.idb_path))
-        };
-
-        match get_db().get_result::<i32>(conn).await {
-            Ok(v) => return Ok(v),
-            Err(err) if err != diesel::result::Error::NotFound => return Err(err.into()),
-            _ => {},
-        };
-
-        match diesel::insert_into(dbs)
-            .values(vec![(
-                db_user.eq(user_id),
-                db_file_id.eq(file_id),
-                file_path.eq(funcs.file_path),
-                idb_path.eq(funcs.idb_path),
-            )])
-            .returning(db_id)
-            .get_result::<i32>(conn)
-            .await
-        {
-            Ok(id) => return Ok(id),
-            Err(diesel::result::Error::DatabaseError(
-                diesel::result::DatabaseErrorKind::UniqueViolation,
-                _,
-            )) => {},
-            Err(e) => return Err(e.into()),
-        };
-        Ok(get_db().get_result::<i32>(conn).await?)
+        Ok(id)
     }
 
     pub async fn push_funcs<'a>(
         &self, user: &'a crate::rpc::RpcHello<'a>, funcs: &'a crate::rpc::PushMetadata<'a>,
         scores: &[u32],
     ) -> Result<Vec<bool>, anyhow::Error> {
-        use futures_util::TryStreamExt;
-
-        // postgres has a limitation of binding per statement (i16::MAX). Split large push requests into smaller chunks.
-        const PUSH_FUNC_CHUNK_SIZE: usize = 3000;
+        // Each row uses 7 bound parameters. Cap chunk size so total params < SQLITE_MAX_VARS.
+        const COLS_PER_ROW: usize = 7;
+        let chunk_size = (SQLITE_MAX_VARS / COLS_PER_ROW).max(1);
 
         let db_id = self.get_or_create_db(user, funcs).await?;
 
-        let mut rows = Vec::with_capacity(funcs.funcs.len().min(PUSH_FUNC_CHUNK_SIZE));
         let mut is_new = Vec::with_capacity(funcs.funcs.len());
-        let conn = &mut self.diesel.get().await?;
-        let f2 = diesel::alias!(schema::funcs as f2);
 
-        for (idx, (func, &score)) in funcs.funcs.iter().zip(scores.iter()).enumerate() {
-            let name = func.name;
-            let len = func.func_len as i32;
-            let chksum = func.hash;
-            let md = func.func_data;
-            let score = score as i32;
+        for chunk in funcs.funcs.chunks(chunk_size).zip(scores.chunks(chunk_size)) {
+            let (func_chunk, score_chunk) = chunk;
 
-            rows.push((
-                schema::funcs::name.eq(name),
-                schema::funcs::len.eq(len),
-                schema::funcs::chksum.eq(chksum),
-                schema::funcs::metadata.eq(md),
-                schema::funcs::rank.eq(score),
-                schema::funcs::db_id.eq(db_id),
-            ));
+            // First, find out which chksums already exist for this db_id.
+            // Sub-chunk again to stay under the parameter cap.
+            let mut existing: HashSet<Vec<u8>> = HashSet::new();
 
-            if rows.len() < PUSH_FUNC_CHUNK_SIZE && idx < funcs.funcs.len() - 1 {
-                continue;
+            for sub in func_chunk.chunks(SQLITE_MAX_VARS) {
+                let placeholders =
+                    std::iter::repeat("?").take(sub.len()).collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT chksum FROM funcs WHERE db_id = ? AND chksum IN ({placeholders})"
+                );
+
+                let mut params: Vec<Value> = Vec::with_capacity(sub.len() + 1);
+                params.push(Value::Integer(db_id as i64));
+                for f in sub {
+                    params.push(Value::Blob(f.hash.to_vec()));
+                }
+
+                let mut rows = self.conn.query(&sql, params_from_iter(params.into_iter())).await?;
+                while let Some(row) = rows.next().await? {
+                    if let Value::Blob(b) = row.get_value(0)? {
+                        existing.insert(b);
+                    }
+                }
             }
 
-            let mut current_rows =
-                Vec::with_capacity((funcs.funcs.len() - (idx + 1)).max(PUSH_FUNC_CHUNK_SIZE));
-            std::mem::swap(&mut current_rows, &mut rows);
+            // Build a single multi-row UPSERT.
+            let mut placeholders = String::new();
+            for (i, _) in func_chunk.iter().enumerate() {
+                if i > 0 {
+                    placeholders.push(',');
+                }
+                placeholders.push_str("(?, ?, ?, ?, ?, ?, ?)");
+            }
 
-            diesel::insert_into(schema::funcs::table)
-                .values(current_rows)
-                .on_conflict((schema::funcs::chksum, schema::funcs::db_id))
-                .do_update()
-                .set((
-                    schema::funcs::name.eq(excluded(schema::funcs::name)),
-                    schema::funcs::metadata.eq(excluded(schema::funcs::metadata)),
-                    schema::funcs::rank.eq(excluded(schema::funcs::rank)),
-                    schema::funcs::update_dt.eq(diesel::dsl::now),
-                ))
-                .returning(diesel::dsl::not(diesel::dsl::exists(
-                    f2.filter(f2.field(schema::funcs::chksum).eq(schema::funcs::chksum)),
-                ))) // xmax=0 when a new row is created.
-                .load_stream::<bool>(conn)
-                .await?
-                .try_fold(&mut is_new, |acc, item: bool| {
-                    acc.push(item);
-                    futures_util::future::ready(Ok(acc))
-                })
-                .await?;
+            let sql = format!(
+                "INSERT INTO funcs (name, len, chksum, metadata, rank, db_id, update_dt)
+                 VALUES {placeholders}
+                 ON CONFLICT(chksum, db_id) DO UPDATE SET
+                     name = excluded.name,
+                     metadata = excluded.metadata,
+                     rank = excluded.rank,
+                     update_dt = excluded.update_dt"
+            );
+
+            let now = OffsetDateTime::now_utc().unix_timestamp();
+            let mut params: Vec<Value> = Vec::with_capacity(func_chunk.len() * COLS_PER_ROW);
+            for (func, &score) in func_chunk.iter().zip(score_chunk.iter()) {
+                params.push(Value::Text(func.name.to_string()));
+                params.push(Value::Integer(func.func_len as i64));
+                params.push(Value::Blob(func.hash.to_vec()));
+                params.push(Value::Blob(func.func_data.to_vec()));
+                params.push(Value::Integer(score as i64));
+                params.push(Value::Integer(db_id as i64));
+                params.push(Value::Integer(now));
+            }
+
+            self.conn.execute(&sql, params_from_iter(params.into_iter())).await?;
+
+            for func in func_chunk {
+                is_new.push(!existing.contains(func.hash));
+            }
         }
 
         Ok(is_new)
@@ -364,115 +387,117 @@ impl Database {
     pub async fn get_file_funcs(
         &self, md5: &[u8], offset: i64, limit: i64,
     ) -> Result<Vec<(String, i32, Vec<u8>)>, anyhow::Error> {
-        let conn = &mut self.diesel.get().await?;
-        let results = schema::funcs::table
-            .left_join(schema::dbs::table.left_join(schema::files::table))
-            .select((
-                schema::funcs::name.assume_not_null(),
-                schema::funcs::len.assume_not_null(),
-                schema::funcs::chksum.assume_not_null(),
-            ))
-            .filter(schema::files::chksum.eq(md5))
-            .offset(offset)
-            .limit(limit)
-            .get_results::<(String, i32, Vec<u8>)>(conn)
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT f.name, f.len, f.chksum
+                 FROM funcs f
+                 JOIN dbs d ON d.id = f.db_id
+                 JOIN files fl ON fl.id = d.file_id
+                 WHERE fl.chksum = ?
+                 LIMIT ? OFFSET ?",
+                params_from_iter(
+                    [
+                        Value::Blob(md5.to_vec()),
+                        Value::Integer(limit),
+                        Value::Integer(offset),
+                    ]
+                    .into_iter(),
+                ),
+            )
             .await?;
-        Ok(results)
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let name = match row.get_value(0)? {
+                Value::Text(s) => s,
+                _ => String::new(),
+            };
+            let len = match row.get_value(1)? {
+                Value::Integer(i) => i as i32,
+                _ => 0,
+            };
+            let chksum = match row.get_value(2)? {
+                Value::Blob(b) => b,
+                _ => Vec::new(),
+            };
+            out.push((name, len, chksum));
+        }
+        Ok(out)
     }
 
     pub async fn get_files_with_func(&self, func: &[u8]) -> Result<Vec<Vec<u8>>, anyhow::Error> {
-        let conn = &mut self.diesel.get().await?;
-
-        let res = schema::files::table
-            .left_join(schema::dbs::table.left_join(schema::funcs::table))
-            .select(schema::files::chksum.assume_not_null())
-            .distinct()
-            .filter(schema::funcs::chksum.eq(func))
-            .get_results::<Vec<u8>>(conn)
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT fl.chksum
+                 FROM files fl
+                 JOIN dbs d ON d.file_id = fl.id
+                 JOIN funcs f ON f.db_id = d.id
+                 WHERE f.chksum = ?",
+                params_from_iter([Value::Blob(func.to_vec())].into_iter()),
+            )
             .await?;
-        Ok(res)
-    }
 
-    fn cancel_guard(
-        &self,
-        conn: &diesel_async::pooled_connection::bb8::PooledConnection<
-            '_,
-            diesel_async::AsyncPgConnection,
-        >,
-    ) -> AsyncDropGuard {
-        let token = conn.cancel_token();
-        let tls_connector = self.tls_connector.clone();
-        self.dropper.defer(async move {
-            debug!("cancelling query...");
-
-            if let Some(tls) = tls_connector {
-                let _ = token.cancel_query(tls).await;
-            } else {
-                let _ = token.cancel_query(NoTls).await;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            if let Value::Blob(b) = row.get_value(0)? {
+                out.push(b);
             }
-        })
+        }
+        Ok(out)
     }
 
     pub async fn delete_metadata(
         &self, req: &crate::rpc::DelHistory<'_>,
     ) -> Result<(), anyhow::Error> {
-        use schema::funcs::{chksum, table as funcs};
+        let mut total = 0u64;
+        for chunk in req.funcs.chunks(SQLITE_MAX_VARS) {
+            let placeholders =
+                std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let sql = format!("DELETE FROM funcs WHERE chksum IN ({placeholders})");
 
-        let chksums = req.funcs.iter().map(|v| v.as_slice()).collect::<Vec<_>>();
+            let params: Vec<Value> = chunk.iter().map(|c| Value::Blob(c.to_vec())).collect();
+            total += self.conn.execute(&sql, params_from_iter(params.into_iter())).await?;
+        }
 
-        let conn = &mut self.diesel.get().await?;
-        let rows_modified =
-            diesel::delete(funcs.filter(chksum.eq_any(&chksums))).execute(conn).await?;
-
-        debug!("deleted {rows_modified} rows");
-
+        debug!("deleted {total} rows");
         Ok(())
     }
 
     pub async fn get_func_histories(
         &self, chksum: &[u8], limit: u32,
     ) -> Result<Vec<(OffsetDateTime, String, Vec<u8>)>, anyhow::Error> {
-        let conn = &mut self.diesel.get().await?;
-        let rows = &schema::funcs::table.select((
-            schema::funcs::update_dt.assume_not_null(),
-            schema::funcs::name,
-            schema::funcs::metadata.assume_not_null(),
-        ));
-        let rows = rows
-            .limit(limit as i64)
-            .order_by(schema::funcs::update_dt.desc())
-            .filter(schema::funcs::chksum.eq(chksum))
-            .get_results::<(time::OffsetDateTime, String, Vec<u8>)>(conn)
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT update_dt, name, metadata FROM funcs
+                 WHERE chksum = ? AND update_dt IS NOT NULL
+                 ORDER BY update_dt DESC
+                 LIMIT ?",
+                params_from_iter(
+                    [Value::Blob(chksum.to_vec()), Value::Integer(limit as i64)].into_iter(),
+                ),
+            )
             .await?;
-        Ok(rows)
-    }
-}
 
-// This is eww, but it's the fastest.
-struct BestMds<'a>(&'a [&'a [u8]]);
-impl<'a> QueryFragment<diesel::pg::Pg> for BestMds<'a> {
-    fn walk_ast<'b>(
-        &'b self, mut pass: diesel::query_builder::AstPass<'_, 'b, diesel::pg::Pg>,
-    ) -> diesel::QueryResult<()> {
-        pass.push_sql(
-            r#"WITH best AS (
-            select chksum,MAX(rank) as maxrank from funcs f1
-            WHERE chksum = ANY("#,
-        );
-        pass.push_bind_param::<Array<Binary>, _>(&self.0)?;
-        pass.push_sql(
-            r#")
-            GROUP BY chksum
-        )
-        SELECT f2.name,f2.len,f2.metadata,f2.chksum FROM best
-        LEFT JOIN funcs f2 ON (best.chksum=f2.chksum AND best.maxrank=f2.rank)"#,
-        );
-        Ok(())
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let ts = match row.get_value(0)? {
+                Value::Integer(i) => i,
+                _ => 0,
+            };
+            let name = match row.get_value(1)? {
+                Value::Text(s) => s,
+                _ => String::new(),
+            };
+            let metadata = match row.get_value(2)? {
+                Value::Blob(b) => b,
+                _ => Vec::new(),
+            };
+            let dt = OffsetDateTime::from_unix_timestamp(ts).unwrap_or_else(|_| OffsetDateTime::UNIX_EPOCH);
+            out.push((dt, name, metadata));
+        }
+        Ok(out)
     }
-}
-impl<'a> diesel::query_builder::QueryId for BestMds<'a> {
-    type QueryId = BestMds<'static>;
-}
-impl<'a> Query for BestMds<'a> {
-    type SqlType = (VarChar, Integer, Binary, Binary);
 }

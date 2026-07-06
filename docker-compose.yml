@@ -1,39 +1,16 @@
 name: lumen
 volumes:
-    postgres_data:
+    lumen_data:
 
 services:
-    db:
-        image: postgres:15.1-alpine
-        container_name: lumina-postgres
-        healthcheck:
-            test: ["CMD", "pg_isready", "-U", "lumina"]
-            interval: 5s
-            retries: 10
-            timeout: 5s
-        environment:
-            POSTGRES_USER: lumina
-            POSTGRES_DB: lumina
-            POSTGRES_PASSWORD: 1
-        expose:
-            - "5432"
-        volumes:
-            - postgres_data:/var/lib/postgresql
-        mem_swappiness: 0
-
     lumina:
         build: .
         image: ghcr.io/naim94a/lumen:master
-        depends_on:
-            db:
-                condition: service_healthy
         ports:
             - 1234:1234
             - 8082:8082
         environment:
             PKCSPASSWD: $PKCSPASSWD
-            DATABASE_URL: postgres://lumina:1@db/lumina
         volumes:
             - ./dockershare:/dockershare
-        links:
-            - db
+            - lumen_data:/data

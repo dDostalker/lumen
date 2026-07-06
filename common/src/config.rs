@@ -28,11 +28,9 @@ pub struct WebServer {
 
 #[derive(Deserialize)]
 pub struct Database {
-    pub connection_info: String,
-
-    pub use_tls: bool,
-    pub server_ca: Option<PathBuf>,
-    pub client_id: Option<PathBuf>,
+    /// Path to the single-file Turso (libSQL/SQLite compatible) database file.
+    /// The file (and parent directory) will be created automatically if missing.
+    pub path: PathBuf,
 }
 
 #[derive(Deserialize, Debug)]

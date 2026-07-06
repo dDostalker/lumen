@@ -4,3 +4,4 @@ private/
 *.pem
 *.p12
 *.crt
+config.toml
