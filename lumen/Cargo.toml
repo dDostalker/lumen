@@ -2,8 +2,8 @@
 name = "lumen"
 description = "lumen server"
 version = "0.2.0"
-authors = ["Naim A. <naim@abda.nl>"]
-edition = "2021"
+authors = ["Naim A. <naim@abda.nl>"] # forked and change by dDostalker <dDostalker@foxmail.com>
+edition = "2024"
 publish = false
 
 [dependencies]

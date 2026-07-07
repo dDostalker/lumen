@@ -16,10 +16,10 @@ mod web;
 use common::config;
 
 fn setup_logger() {
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", concat!(env!("CARGO_PKG_NAME"), "=info"));
-    }
-    pretty_env_logger::init_timed();
+    pretty_env_logger::formatted_timed_builder()
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .init();
 }
 
 /// Ensure `LUMINA_TLS=false` for the current user.
@@ -44,10 +44,6 @@ fn ensure_lumina_tls_disabled() {
         return;
     }
 
-    // Update the current process env as well.
-    std::env::set_var("LUMINA_TLS", "false");
-
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
         match persist_lumina_tls_user_env() {
             Ok(detail) => info!("ADD LUMINA_TLS to USER PATH{detail}"),

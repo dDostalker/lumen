@@ -3,7 +3,7 @@ name = "common"
 description = "common utilities for lumen"
 version = "0.2.0"
 authors = ["Naim A. <naim@abda.nl>"] # forked and change by dDostalker <dDostalker@foxmail.com>
-edition = "2021"
+edition = "2024"
 publish = false
 
 [dependencies]
