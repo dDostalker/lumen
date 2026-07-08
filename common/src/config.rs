@@ -32,6 +32,33 @@ pub struct Database {
     /// The file (and parent directory) will be created automatically if missing.
     pub path: PathBuf,
 }
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct Ignore {
+    /// Ignore the library function signatures automatically detected by IDA
+    pub fcomment: Vec<String>,
+    pub bcomment: Vec<String>,
+    pub ecomment: Vec<String>,
+}
+impl Default for Ignore {
+    fn default() -> Self {
+        Self {
+            fcomment: vec![
+                "Microsoft VisualC v14 64bit runtime".to_string(),
+                "Microsoft VisualC 64bit universal runtime".to_string(),
+            ],
+            ecomment: vec!["Trap to Debugger".to_string(), "switch jump".to_string()],
+            bcomment: vec![
+                "jump table for switch statement".to_string(),
+                "indirect table for switch statement".to_string(),
+                "Microsoft VisualC v7/14 64bit runtime".to_string(),
+                "Microsoft VisualC v7/14 64bit runtime\nMicrosoft VisualC v14 64bit runtime"
+                    .to_string(),
+                "Microsoft VisualC v14 64bit runtime".to_string(),
+            ],
+        }
+    }
+}
 
 #[derive(Deserialize, Debug)]
 #[serde(default)]
@@ -65,7 +92,7 @@ pub struct Config {
     pub lumina: LuminaServer,
     pub api_server: Option<WebServer>,
     pub database: Database,
-
+    pub ignore: Ignore,
     #[serde(default)]
     pub limits: Limits,
 }

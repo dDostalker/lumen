@@ -13,10 +13,18 @@ get_history_limit = 50
 
 # only required when `use_tls` is set to true.
 [lumina.tls]
-# Specify the server's certificate. 
+# Specify the server's certificate.
 # Clients connecting to the server must match this certificate.
 # If the certificate is password protected, the password can be specified in the `PKCSPASSWD` environment variable.
 server_cert = "path/to/server_crt"
+
+[ignore]
+# Ignore function comment, such as : Microsoft VisualC v14 64bit runtime
+fcomment = []
+# Ignore btye comment such as:
+bcomment = []
+# Ignore extra comment such as: Trap to Debugger
+ecomment = []
 
 [database]
 # Path to the single-file Turso (libSQL / SQLite-compatible) database.

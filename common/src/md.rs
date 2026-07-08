@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::rpc::de::from_slice;
+use crate::{config::Ignore, rpc::de::from_slice};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -37,8 +37,7 @@ pub struct ExtraComment<'a> {
 }
 
 impl<'a> FunctionMetadata<'a> {
-    fn is_useful(&self) -> bool {
-        // TODO: rewrite using regex with configurable library names
+    fn is_useful(&self, ign_cmt: &Ignore) -> bool {
         match self {
             FunctionMetadata::ExtraComment(cmt) => {
                 if cmt.anterior.starts_with("; Exported entry ")
@@ -46,14 +45,15 @@ impl<'a> FunctionMetadata<'a> {
                 {
                     return false;
                 }
-                if cmt.anterior.is_empty() && cmt.posterior.is_empty() {
+                if cmt.anterior.is_empty() && cmt.posterior.is_empty()
+                    || ign_cmt.ecomment.iter().any(|s| s.as_str() == cmt.anterior)
+                    || ign_cmt.ecomment.iter().any(|s| s.as_str() == cmt.posterior)
+                {
                     return false;
                 }
             },
             FunctionMetadata::FunctionComment(cmt) => {
-                if cmt.comment == "Microsoft VisualC v14 64bit runtime"
-                    || cmt.comment == "Microsoft VisualC 64bit universal runtime"
-                {
+                if ign_cmt.fcomment.iter().any(|s| s.as_str() == cmt.comment) {
                     return false;
                 }
                 if cmt.comment.is_empty() {
@@ -61,16 +61,11 @@ impl<'a> FunctionMetadata<'a> {
                 }
             },
             FunctionMetadata::ByteComment(cmt) => {
-                if cmt.comment == "Trap to Debugger"
-                    || (cmt.comment.starts_with("jumptable ") && cmt.comment.contains(" case")) // repeatable=true
-                    || cmt.comment == "switch jump"
+                if (cmt.comment.starts_with("jumptable ") && cmt.comment.contains(" case")) // repeatable=true
                     || (cmt.comment.starts_with("switch ") && cmt.comment.ends_with(" cases "))
-                    || cmt.comment == "jump table for switch statement"
-                    || cmt.comment == "indirect table for switch statement"
-                    || cmt.comment == "Microsoft VisualC v7/14 64bit runtime"
-                    || cmt.comment == "Microsoft VisualC v7/14 64bit runtime\nMicrosoft VisualC v14 64bit runtime"
-                    || cmt.comment == "Microsoft VisualC v14 64bit runtime" {
-                        return false;
+                    || ign_cmt.bcomment.iter().any(|s| s.as_str() == cmt.comment)
+                {
+                    return false;
                 }
                 if cmt.comment.is_empty() {
                     return false;
@@ -182,8 +177,8 @@ pub fn parse_metadata(mut data: &[u8]) -> Result<Vec<FunctionMetadata<'_>>, crat
                 for comment in byte_comments {
                     res.push(FunctionMetadata::ExtraComment(ExtraComment {
                         offset: comment.0,
-                        anterior: std::str::from_utf8(comment.1 .0)?,
-                        posterior: std::str::from_utf8(comment.1 .1)?,
+                        anterior: std::str::from_utf8(comment.1.0)?,
+                        posterior: std::str::from_utf8(comment.1.1)?,
                     }));
                 }
             },
@@ -197,7 +192,7 @@ pub fn parse_metadata(mut data: &[u8]) -> Result<Vec<FunctionMetadata<'_>>, crat
     Ok(res)
 }
 
-pub fn get_score(md: &crate::rpc::PushMetadataFunc) -> u32 {
+pub fn get_score(md: &crate::rpc::PushMetadataFunc, ign_cmt: &Ignore) -> u32 {
     let mut score = 0;
 
     let md = match parse_metadata(md.func_data) {
@@ -209,7 +204,7 @@ pub fn get_score(md: &crate::rpc::PushMetadataFunc) -> u32 {
     };
 
     for md in md {
-        if md.is_useful() {
+        if md.is_useful(ign_cmt) {
             score += 10;
         }
     }

@@ -3,13 +3,13 @@ use std::{
 };
 
 use common::{
+    SharedState, SharedState_,
     async_drop::AsyncDropper,
-    config::Config,
+    config::{Config, Ignore},
     db::Database,
     make_pretty_hex, md,
     metrics::LuminaVersion,
     rpc::{self, Error, HelloResult, RpcFail, RpcHello, RpcMessage},
-    SharedState, SharedState_,
 };
 use log::{debug, error, info, trace, warn};
 use native_tls::Identity;
@@ -22,7 +22,7 @@ use tokio::{
 use crate::web;
 
 async fn handle_transaction<'a, S: AsyncRead + AsyncWrite + Unpin>(
-    state: &SharedState, user: &'a RpcHello<'a>, mut stream: S,
+    state: &SharedState, user: &'a RpcHello<'a>, mut stream: S, cmt: &Ignore,
 ) -> Result<(), Error> {
     let db = &state.db;
     let server_name = state.server_name.as_str();
@@ -122,7 +122,7 @@ async fn handle_transaction<'a, S: AsyncRead + AsyncWrite + Unpin>(
         RpcMessage::PushMetadata(mds) => {
             // parse the function's metadata
             let start = Instant::now();
-            let scores: Vec<u32> = mds.funcs.iter().map(md::get_score).collect();
+            let scores: Vec<u32> = mds.funcs.iter().map(|f| md::get_score(f, cmt)).collect();
 
             let status = match db.push_funcs(user, &mds, &scores).await {
                 Ok(v) => v.into_iter().map(u32::from).collect::<Vec<u32>>(),
@@ -253,7 +253,7 @@ async fn handle_transaction<'a, S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(
-    state: &SharedState, mut stream: S,
+    state: &SharedState, mut stream: S, cmt: &Ignore,
 ) -> Result<(), rpc::Error> {
     let server_name = &state.server_name;
     let hello =
@@ -315,12 +315,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(
     resp.async_write(&mut stream).await?;
 
     loop {
-        handle_transaction(state, &hello, &mut stream).await?;
+        handle_transaction(state, &hello, &mut stream, cmt).await?;
     }
 }
 
-async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(state: &SharedState, mut s: S) {
-    if let Err(ref err) = handle_client(state, &mut s).await {
+async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    state: &SharedState, mut s: S, cmt: Ignore,
+) {
+    if let Err(ref err) = handle_client(state, &mut s, &cmt).await {
         if discriminant(err) == discriminant(&Error::HttpReq) {
             warn!("got http req");
             const BAD_REQ_BODY: &str = include_str!("bad_req.html");
@@ -346,7 +348,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(state: &SharedStat
 
 async fn serve(
     listener: TcpListener, accpt: Option<tokio_native_tls::TlsAcceptor>, state: SharedState,
-    mut shutdown_signal: tokio::sync::oneshot::Receiver<()>,
+    mut shutdown_signal: tokio::sync::oneshot::Receiver<()>, cmt: Ignore,
 ) {
     let accpt = accpt.map(Arc::new);
 
@@ -402,6 +404,7 @@ async fn serve(
         });
 
         let counter = state.metrics.active_connections.clone();
+        let cmt = cmt.clone();
         let handle = tokio::spawn(async move {
             let _guard = guard;
             let count = { counter.inc() + 1 };
@@ -414,7 +417,7 @@ async fn serve(
                     {
                         Ok(r) => match r {
                             Ok(s) => {
-                                handle_connection(&state, s).await;
+                                handle_connection(&state, s, cmt).await;
                             },
                             Err(err) => debug!("tls accept ({}): {}", &addr, err),
                         },
@@ -423,7 +426,7 @@ async fn serve(
                         },
                     };
                 },
-                None => handle_connection(&state, client).await,
+                None => handle_connection(&state, client, cmt).await,
             }
         });
 
@@ -444,7 +447,7 @@ pub(crate) async fn do_lumen(config: Arc<Config>) {
     };
 
     let server_name = config.lumina.server_name.clone().unwrap_or_else(|| String::from("lumen"));
-
+    let cmt = config.ignore.clone();
     let state = Arc::new(SharedState_ {
         db,
         config,
@@ -514,7 +517,7 @@ pub(crate) async fn do_lumen(config: Arc<Config>) {
 
         info!("listening on {:?} secure={}", server.local_addr().unwrap(), tls_acceptor.is_some());
 
-        serve(server, tls_acceptor, state, exit_signal_rx).await;
+        serve(server, tls_acceptor, state, exit_signal_rx, cmt).await;
     };
 
     let server_handle = tokio::task::spawn(async_server);
