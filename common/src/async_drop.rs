@@ -1,6 +1,6 @@
-use futures_util::{future::BoxFuture, Future};
+use futures_util::{Future, future::BoxFuture};
 use log::trace;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, WeakUnboundedSender};
+use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender, unbounded_channel};
 
 enum AsyncDropperMsg {
     Future(BoxFuture<'static, ()>),
@@ -68,10 +68,10 @@ impl AsyncDropGuard {
 
 impl Drop for AsyncDropGuard {
     fn drop(&mut self) {
-        if let Some(fun) = self.run.take() {
-            if let Some(tx) = self.tx.upgrade() {
-                let _ = tx.send(AsyncDropperMsg::Future(fun));
-            }
+        if let Some(fun) = self.run.take()
+            && let Some(tx) = self.tx.upgrade()
+        {
+            let _ = tx.send(AsyncDropperMsg::Future(fun));
         }
     }
 }

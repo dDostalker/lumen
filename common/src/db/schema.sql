@@ -36,3 +36,10 @@ CREATE TABLE IF NOT EXISTS funcs (
 CREATE UNIQUE INDEX IF NOT EXISTS funcs_db ON funcs (chksum, db_id);
 CREATE INDEX IF NOT EXISTS funcs_ranking ON funcs (chksum, rank);
 CREATE INDEX IF NOT EXISTS func_chksum ON funcs (chksum);
+
+CREATE TABLE IF NOT EXISTS web_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+);

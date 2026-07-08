@@ -18,6 +18,8 @@ anyhow = "1.0.102"
 prometheus-client = "0.22.3"
 time = "0.3.47"
 turso = "0.6.1"
+sha2 = "0.10"
+hex = "0.4"
 
 [features]
 default = ["web", "db"]

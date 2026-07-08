@@ -24,6 +24,9 @@ pub struct LuminaServer {
 #[derive(Deserialize)]
 pub struct WebServer {
     pub bind_addr: SocketAddr,
+    /// If set, require HTTP Basic Auth for the web API.
+    /// Credentials are verified against the `web_users` database table.
+    pub require_auth: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -92,6 +95,7 @@ pub struct Config {
     pub lumina: LuminaServer,
     pub api_server: Option<WebServer>,
     pub database: Database,
+    #[serde(default)]
     pub ignore: Ignore,
     #[serde(default)]
     pub limits: Limits,

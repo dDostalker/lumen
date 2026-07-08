@@ -288,13 +288,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(
         .inc();
 
     if let Some(ref creds) = creds {
-        if creds.username != "guest" {
-            // Only allow "guest" to connect for now.
-            rpc::RpcMessage::Fail(rpc::RpcFail {
-                code: 1,
-                message: &format!("{server_name}: invalid username or password. Try logging in with `guest` instead."),
-            }).async_write(&mut stream).await?;
-            return Ok(());
+        match state.db.verify_web_user(creds.username, creds.password).await {
+            Ok(true) => {},
+            Ok(false) | Err(_) => {
+                rpc::RpcMessage::Fail(rpc::RpcFail {
+                    code: 1,
+                    message: &format!("{server_name}: invalid username or password."),
+                })
+                .async_write(&mut stream)
+                .await?;
+                return Ok(());
+            },
         }
     }
 
@@ -409,7 +413,7 @@ async fn serve(
             let _guard = guard;
             let count = { counter.inc() + 1 };
             let protocol = if accpt.is_some() { " [TLS]" } else { "" };
-            debug!("Connection from {:?}{}: {} active connections", &addr, protocol, count);
+            debug!("Connection from {:?}{}: {} active connections", addr, protocol, count);
             match accpt {
                 Some(accpt) => {
                     match timeout(state.config.limits.tls_handshake_timeout, accpt.accept(client))
@@ -419,10 +423,10 @@ async fn serve(
                             Ok(s) => {
                                 handle_connection(&state, s, cmt).await;
                             },
-                            Err(err) => debug!("tls accept ({}): {}", &addr, err),
+                            Err(err) => debug!("tls accept ({}): {}", addr, err),
                         },
                         Err(_) => {
-                            debug!("client {} didn't complete ssl handshake in time.", &addr);
+                            debug!("client {} didn't complete ssl handshake in time.", addr);
                         },
                     };
                 },
@@ -448,6 +452,23 @@ pub(crate) async fn do_lumen(config: Arc<Config>) {
 
     let server_name = config.lumina.server_name.clone().unwrap_or_else(|| String::from("lumen"));
     let cmt = config.ignore.clone();
+
+    // If web API auth is enabled but no users exist, create a default admin user.
+    let require_web_auth =
+        config.api_server.as_ref().and_then(|ws| ws.require_auth).unwrap_or(false);
+    if require_web_auth && !db.has_web_users().await.unwrap_or(false) {
+        let default_user = "admin";
+        let default_pass = "admin";
+        db.upsert_web_user(default_user, default_pass).await.unwrap_or_else(|e| {
+            error!("failed to create default web user: {}", e);
+        });
+        warn!(
+            "No web users found! Created default user '{}' with password '{}'. \
+             Please change the password immediately.",
+            default_user, default_pass
+        );
+    }
+
     let state = Arc::new(SharedState_ {
         db,
         config,
@@ -455,9 +476,7 @@ pub(crate) async fn do_lumen(config: Arc<Config>) {
         metrics: common::metrics::Metrics::default(),
     });
 
-    let tls_acceptor;
-
-    if state.config.lumina.use_tls.unwrap_or_default() {
+    let tls_acceptor = if state.config.lumina.use_tls.unwrap_or_default() {
         let cert_path =
             &state.config.lumina.tls.as_ref().expect("tls section is missing").server_cert;
         let mut crt = match std::fs::read(cert_path) {
@@ -488,15 +507,15 @@ pub(crate) async fn do_lumen(config: Arc<Config>) {
             },
         };
         let accpt = tokio_native_tls::TlsAcceptor::from(accpt);
-        tls_acceptor = Some(accpt);
+        Some(accpt)
     } else {
-        tls_acceptor = None;
-    }
+        None
+    };
 
     let web_handle = if let Some(ref webcfg) = state.config.api_server {
         let bind_addr = webcfg.bind_addr;
         let state = state.clone();
-        info!("starting http api server on {:?}", &bind_addr);
+        info!("starting http api server on {:?}", bind_addr);
         Some(tokio::spawn(async move {
             web::start_webserver(bind_addr, state).await;
         }))

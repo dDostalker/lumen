@@ -1,8 +1,9 @@
 use log::*;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
-use turso::{params_from_iter, Builder, Connection, Value};
+use turso::{Builder, Connection, Value, params_from_iter};
 
 pub mod schema;
 
@@ -39,10 +40,10 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 impl Database {
     pub async fn open(config: &crate::config::Database) -> Result<Self, anyhow::Error> {
         // Make sure the parent directory exists so we can create the file.
-        if let Some(parent) = config.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await.ok();
-            }
+        if let Some(parent) = config.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await.ok();
         }
 
         let path = config.path.to_string_lossy().into_owned();
@@ -68,7 +69,7 @@ impl Database {
 
         // SQLite has no `ANY($array)`; emulate by chunking `IN (?, ?, ...)` queries.
         for chunk in chksums.chunks(SQLITE_MAX_VARS) {
-            let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "WITH best AS (
                     SELECT chksum, MAX(rank) AS maxrank FROM funcs
@@ -81,7 +82,7 @@ impl Database {
             );
 
             let params: Vec<Value> = chunk.iter().map(|c| Value::Blob(c.to_vec())).collect();
-            let mut rows = self.conn.query(&sql, params_from_iter(params.into_iter())).await?;
+            let mut rows = self.conn.query(&sql, params_from_iter(params)).await?;
 
             while let Some(row) = rows.next().await? {
                 let name = match row.get_value(0)? {
@@ -102,10 +103,7 @@ impl Database {
                     _ => continue,
                 };
 
-                partial.insert(
-                    chksum,
-                    FunctionInfo { name, len, data: metadata, popularity: 0 },
-                );
+                partial.insert(chksum, FunctionInfo { name, len, data: metadata, popularity: 0 });
             }
         }
 
@@ -128,36 +126,30 @@ impl Database {
             .conn
             .query(
                 "SELECT id FROM users WHERE lic_id = ? AND lic_data = ? AND hostname = ?",
-                params_from_iter(
-                    [
-                        Value::Blob(lic_id.to_vec()),
-                        Value::Blob(lic_data.to_vec()),
-                        Value::Text(hostname.to_string()),
-                    ]
-                    .into_iter(),
-                ),
+                params_from_iter([
+                    Value::Blob(lic_id.to_vec()),
+                    Value::Blob(lic_data.to_vec()),
+                    Value::Text(hostname.to_string()),
+                ]),
             )
             .await?
             .next()
             .await?;
 
-        if let Some(row) = row {
-            if let Value::Integer(id) = row.get_value(0)? {
-                return Ok(id as i32);
-            }
+        if let Some(row) = row
+            && let Value::Integer(id) = row.get_value(0)?
+        {
+            return Ok(id as i32);
         }
 
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO users (lic_id, lic_data, hostname) VALUES (?, ?, ?)",
-                params_from_iter(
-                    [
-                        Value::Blob(lic_id.to_vec()),
-                        Value::Blob(lic_data.to_vec()),
-                        Value::Text(hostname.to_string()),
-                    ]
-                    .into_iter(),
-                ),
+                params_from_iter([
+                    Value::Blob(lic_id.to_vec()),
+                    Value::Blob(lic_data.to_vec()),
+                    Value::Text(hostname.to_string()),
+                ]),
             )
             .await?;
 
@@ -165,14 +157,11 @@ impl Database {
             .conn
             .query(
                 "SELECT id FROM users WHERE lic_id = ? AND lic_data = ? AND hostname = ?",
-                params_from_iter(
-                    [
-                        Value::Blob(lic_id.to_vec()),
-                        Value::Blob(lic_data.to_vec()),
-                        Value::Text(hostname.to_string()),
-                    ]
-                    .into_iter(),
-                ),
+                params_from_iter([
+                    Value::Blob(lic_id.to_vec()),
+                    Value::Blob(lic_data.to_vec()),
+                    Value::Text(hostname.to_string()),
+                ]),
             )
             .await?
             .next()
@@ -195,22 +184,22 @@ impl Database {
             .conn
             .query(
                 "SELECT id FROM files WHERE chksum = ?",
-                params_from_iter([Value::Blob(hash.to_vec())].into_iter()),
+                params_from_iter([Value::Blob(hash.to_vec())]),
             )
             .await?
             .next()
             .await?;
 
-        if let Some(row) = row {
-            if let Value::Integer(id) = row.get_value(0)? {
-                return Ok(id as i32);
-            }
+        if let Some(row) = row
+            && let Value::Integer(id) = row.get_value(0)?
+        {
+            return Ok(id as i32);
         }
 
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO files (chksum) VALUES (?)",
-                params_from_iter([Value::Blob(hash.to_vec())].into_iter()),
+                params_from_iter([Value::Blob(hash.to_vec())]),
             )
             .await?;
 
@@ -218,7 +207,7 @@ impl Database {
             .conn
             .query(
                 "SELECT id FROM files WHERE chksum = ?",
-                params_from_iter([Value::Blob(hash.to_vec())].into_iter()),
+                params_from_iter([Value::Blob(hash.to_vec())]),
             )
             .await?
             .next()
@@ -238,29 +227,23 @@ impl Database {
         let file_id = self.get_or_create_file(funcs).await?;
         let user_id = self.get_or_create_user(user, funcs.hostname).await?;
 
-        let params = params_from_iter(
-            [
-                Value::Integer(file_id as i64),
-                Value::Integer(user_id as i64),
-                Value::Text(funcs.idb_path.to_string()),
-            ]
-            .into_iter(),
-        );
+        let params = params_from_iter([
+            Value::Integer(file_id as i64),
+            Value::Integer(user_id as i64),
+            Value::Text(funcs.idb_path.to_string()),
+        ]);
 
         let row = self
             .conn
-            .query(
-                "SELECT id FROM dbs WHERE file_id = ? AND user_id = ? AND idb_path = ?",
-                params,
-            )
+            .query("SELECT id FROM dbs WHERE file_id = ? AND user_id = ? AND idb_path = ?", params)
             .await?
             .next()
             .await?;
 
-        if let Some(row) = row {
-            if let Value::Integer(id) = row.get_value(0)? {
-                return Ok(id as i32);
-            }
+        if let Some(row) = row
+            && let Value::Integer(id) = row.get_value(0)?
+        {
+            return Ok(id as i32);
         }
 
         self.conn
@@ -273,7 +256,7 @@ impl Database {
                         Value::Text(funcs.file_path.to_string()),
                         Value::Text(funcs.idb_path.to_string()),
                     ]
-                    .into_iter(),
+
                 ),
             )
             .await?;
@@ -282,14 +265,11 @@ impl Database {
             .conn
             .query(
                 "SELECT id FROM dbs WHERE file_id = ? AND user_id = ? AND idb_path = ?",
-                params_from_iter(
-                    [
-                        Value::Integer(file_id as i64),
-                        Value::Integer(user_id as i64),
-                        Value::Text(funcs.idb_path.to_string()),
-                    ]
-                    .into_iter(),
-                ),
+                params_from_iter([
+                    Value::Integer(file_id as i64),
+                    Value::Integer(user_id as i64),
+                    Value::Text(funcs.idb_path.to_string()),
+                ]),
             )
             .await?
             .next()
@@ -324,7 +304,7 @@ impl Database {
 
             for sub in func_chunk.chunks(SQLITE_MAX_VARS) {
                 let placeholders =
-                    std::iter::repeat("?").take(sub.len()).collect::<Vec<_>>().join(",");
+                    std::iter::repeat_n("?", sub.len()).collect::<Vec<_>>().join(",");
                 let sql = format!(
                     "SELECT chksum FROM funcs WHERE db_id = ? AND chksum IN ({placeholders})"
                 );
@@ -335,7 +315,7 @@ impl Database {
                     params.push(Value::Blob(f.hash.to_vec()));
                 }
 
-                let mut rows = self.conn.query(&sql, params_from_iter(params.into_iter())).await?;
+                let mut rows = self.conn.query(&sql, params_from_iter(params)).await?;
                 while let Some(row) = rows.next().await? {
                     if let Value::Blob(b) = row.get_value(0)? {
                         existing.insert(b);
@@ -374,7 +354,7 @@ impl Database {
                 params.push(Value::Integer(now));
             }
 
-            self.conn.execute(&sql, params_from_iter(params.into_iter())).await?;
+            self.conn.execute(&sql, params_from_iter(params)).await?;
 
             for func in func_chunk {
                 is_new.push(!existing.contains(func.hash));
@@ -396,14 +376,11 @@ impl Database {
                  JOIN files fl ON fl.id = d.file_id
                  WHERE fl.chksum = ?
                  LIMIT ? OFFSET ?",
-                params_from_iter(
-                    [
-                        Value::Blob(md5.to_vec()),
-                        Value::Integer(limit),
-                        Value::Integer(offset),
-                    ]
-                    .into_iter(),
-                ),
+                params_from_iter([
+                    Value::Blob(md5.to_vec()),
+                    Value::Integer(limit),
+                    Value::Integer(offset),
+                ]),
             )
             .await?;
 
@@ -435,7 +412,7 @@ impl Database {
                  JOIN dbs d ON d.file_id = fl.id
                  JOIN funcs f ON f.db_id = d.id
                  WHERE f.chksum = ?",
-                params_from_iter([Value::Blob(func.to_vec())].into_iter()),
+                params_from_iter([Value::Blob(func.to_vec())]),
             )
             .await?;
 
@@ -453,12 +430,11 @@ impl Database {
     ) -> Result<(), anyhow::Error> {
         let mut total = 0u64;
         for chunk in req.funcs.chunks(SQLITE_MAX_VARS) {
-            let placeholders =
-                std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
             let sql = format!("DELETE FROM funcs WHERE chksum IN ({placeholders})");
 
             let params: Vec<Value> = chunk.iter().map(|c| Value::Blob(c.to_vec())).collect();
-            total += self.conn.execute(&sql, params_from_iter(params.into_iter())).await?;
+            total += self.conn.execute(&sql, params_from_iter(params)).await?;
         }
 
         debug!("deleted {total} rows");
@@ -475,9 +451,7 @@ impl Database {
                  WHERE chksum = ? AND update_dt IS NOT NULL
                  ORDER BY update_dt DESC
                  LIMIT ?",
-                params_from_iter(
-                    [Value::Blob(chksum.to_vec()), Value::Integer(limit as i64)].into_iter(),
-                ),
+                params_from_iter([Value::Blob(chksum.to_vec()), Value::Integer(limit as i64)]),
             )
             .await?;
 
@@ -495,9 +469,88 @@ impl Database {
                 Value::Blob(b) => b,
                 _ => Vec::new(),
             };
-            let dt = OffsetDateTime::from_unix_timestamp(ts).unwrap_or_else(|_| OffsetDateTime::UNIX_EPOCH);
+            let dt = OffsetDateTime::from_unix_timestamp(ts).unwrap_or(OffsetDateTime::UNIX_EPOCH);
             out.push((dt, name, metadata));
         }
         Ok(out)
+    }
+
+    /// Verify a username/password against the web_users table.
+    /// Returns true if the credentials are valid.
+    pub async fn verify_web_user(
+        &self, username: &str, password: &str,
+    ) -> Result<bool, anyhow::Error> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT password_hash FROM web_users WHERE username = ?",
+                params_from_iter([Value::Text(username.to_string())]),
+            )
+            .await?;
+
+        let row = rows.next().await?;
+        let stored_hash = match row {
+            Some(row) => match row.get_value(0)? {
+                Value::Text(s) => s,
+                _ => return Ok(false),
+            },
+            None => return Ok(false),
+        };
+
+        // Format: "salt:hash"
+        let parts: Vec<&str> = stored_hash.split(':').collect();
+        if parts.len() != 2 {
+            return Ok(false);
+        }
+        let salt = parts[0];
+        let expected_hash = parts[1];
+
+        let mut hasher = Sha256::new();
+        hasher.update(salt.as_bytes());
+        hasher.update(password.as_bytes());
+        let computed = hex::encode(hasher.finalize());
+
+        Ok(computed == expected_hash)
+    }
+
+    /// Hash a password with a random salt. Returns "salt:hash" format.
+    pub fn hash_password(password: &str) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let salt =
+            format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
+        let mut hasher = Sha256::new();
+        hasher.update(salt.as_bytes());
+        hasher.update(password.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+        format!("{salt}:{hash}")
+    }
+
+    /// Create or update a web user with a hashed password.
+    /// If the user already exists, the password is updated.
+    pub async fn upsert_web_user(
+        &self, username: &str, password: &str,
+    ) -> Result<(), anyhow::Error> {
+        let password_hash = Self::hash_password(password);
+        self.conn
+            .execute(
+                "INSERT INTO web_users (username, password_hash) VALUES (?, ?)
+                 ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash",
+                params_from_iter([Value::Text(username.to_string()), Value::Text(password_hash)]),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Check if any web users exist.
+    pub async fn has_web_users(&self) -> Result<bool, anyhow::Error> {
+        let params: Vec<Value> = vec![];
+        let mut rows =
+            self.conn.query("SELECT COUNT(*) FROM web_users", params_from_iter(params)).await?;
+        if let Some(row) = rows.next().await?
+            && let Value::Integer(count) = row.get_value(0)?
+        {
+            return Ok(count > 0);
+        }
+        Ok(false)
     }
 }

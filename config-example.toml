@@ -36,3 +36,8 @@ path = "lumen.db"
 # api server allows to query the database for comments by file or function hash.
 [api_server]
 bind_addr = "0.0.0.0:8082"
+# Set to true to require HTTP Basic Auth for the web API.
+# Users and hashed passwords are stored in the `web_users` database table.
+# Use a tool or script to add users with `INSERT INTO web_users (username, password_hash) ...`
+# or use the Database::upsert_web_user method.
+require_auth = false

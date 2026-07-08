@@ -58,10 +58,7 @@ fn persist_lumina_tls_user_env() -> Result<String, std::io::Error> {
     let out = Command::new("setx").args(["LUMINA_TLS", "false"]).output()?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("setx: {}", stderr.trim()),
-        ));
+        return Err(std::io::Error::other(format!("setx: {}", stderr.trim())));
     }
     Ok(String::new())
 }
@@ -117,8 +114,7 @@ async fn main() {
     ensure_lumina_tls_disabled();
     let matches = clap::Command::new("lumen")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("lumen is a private Lumina server for IDA.\nVisit https://github.com/naim94a/lumen/ for updates.")
-        .author("Naim A. <naim@abda.nl>")
+        .about("lumen is a private Lumina server for IDA.\nVisit https://github.com/dDostalker/lumen/ for updates.")
         .arg(
             Arg::new("config")
                 .short('c')
