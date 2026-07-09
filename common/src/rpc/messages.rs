@@ -57,7 +57,7 @@ pub struct PullMetadataResult<'a> {
     pub funcs: Cow<'a, [PullMetadataResultFunc<'a>]>,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct PushMetadataFunc<'a> {
     pub name: &'a str,
     pub func_len: u32,
@@ -68,7 +68,7 @@ pub struct PushMetadataFunc<'a> {
     pub hash: &'a [u8],
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct PushMetadata<'a> {
     pub unk0: u32,
     pub idb_path: &'a str,
@@ -154,3 +154,23 @@ pub struct GetFuncHistoriesResult<'a> {
     pub users: Cow<'a, [Cow<'a, str>]>,
     pub dbs: Cow<'a, [Cow<'a, str>]>,
 }
+/*
+* pub struct PushMetadataFunc<'a> {
+    pub name: &'a str,
+    pub func_len: u32,
+    pub func_data: &'a [u8],
+    pub meta_flags: u32,      // 原 unk2
+    pub func_hash: &'a [u8],  // 原 hash
+}
+
+pub struct PushMetadata<'a> {
+    pub request_flags: u32,   // 原 unk0
+    pub idb_path: &'a str,
+    pub file_path: &'a str,
+    pub md5: [u8; 16],
+    pub hostname: &'a str,
+    pub funcs: Cow<'a, [PushMetadataFunc<'a>]>,
+    pub func_ids: Cow<'a, [u64]>, // 原 unk1
+}
+*
+*/

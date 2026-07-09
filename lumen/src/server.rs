@@ -300,6 +300,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(
                 return Ok(());
             },
         }
+    } else {
+        rpc::RpcMessage::Fail(rpc::RpcFail {
+            code: 1,
+            message: &format!("{server_name}: authentication required."),
+        })
+        .async_write(&mut stream)
+        .await?;
+        return Ok(());
     }
 
     let resp = match hello.protocol_version {

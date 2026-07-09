@@ -4,15 +4,12 @@
 
 A private Lumina server that can be used with IDA Pro 7.2+.
 
-[lumen.abda.nl](https://lumen.abda.nl/) runs this server.
-
-You can read about the protocol research [here](https://abda.nl/posts/introducing-lumen/).
-
 ## Features
 
 - Stores function signatures so you (and your team) can quickly identify functions that you found in the past using IDA's built-in Lumina features.
 - Backed by Turso (libSQL/SQLite-compatible) — a single embedded database file. No external database server, no setup, no migrations; the schema is initialized automatically on first run.
 - Experimental HTTP API that allows querying the database for comments by file or function hash.
+- Username/password authentication for both IDA clients and the Web API, backed by the database.
 
 ## Getting Started
 
@@ -71,7 +68,7 @@ set LUMINA_TLS=false
 
 ##### Setup IDA
 
-- Go to Options, General, Lumina. Select "Use a private server", then set your host and port and "guest" as username and password. Click on ok.
+- Go to Options, General, Lumina. Select "Use a private server", then set your host and port and a username/password pair that exists in the `web_users` database table. Click on ok.
 
 #### IDA Pro < 8.1
 
@@ -92,6 +89,41 @@ LUMINA_PORT = 1234
 // Only if TLS isn't used:
 LUMINA_TLS = NO
 ```
+
+### Authentication
+
+Lumen requires username/password authentication for both IDA RPC connections
+and the Web API. Credentials are stored in the `web_users` database table.
+
+- **All connections** must provide credentials that match a user in `web_users`.
+- **No credentials** → connection is rejected with "authentication required".
+
+#### Enabling Web API Auth
+
+Set `require_auth = true` in the `[api_server]` section of `config.toml`:
+
+```toml
+[api_server]
+bind_addr = "0.0.0.0:8082"
+require_auth = true
+```
+
+All `/api/*` routes will then require HTTP Basic Auth. Credentials are
+checked against the `web_users` table.
+
+#### Default Admin User
+
+When `require_auth = true` and no users exist yet, Lumen automatically creates
+a default user on startup:
+
+```
+Username: admin
+Password: admin
+```
+
+**Change this password immediately** by updating the `password_hash` column
+in `web_users`, or use `upsert_web_user` to overwrite it. A warning is
+printed to the terminal on first run.
 
 ### Configuring TLS
 
