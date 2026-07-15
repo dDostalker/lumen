@@ -92,10 +92,12 @@ LUMINA_TLS = NO
 
 ### Authentication
 
-Lumen requires username/password authentication for both IDA RPC connections
-and the Web API. Credentials are stored in the `web_users` database table.
+Lumen requires username/password authentication for IDA RPC connections and,
+when enabled, the Web API. Regular user credentials are stored in the
+`web_users` database table.
 
-- **All connections** must provide credentials that match a user in `web_users`.
+- **guest** can use any password and has read-only access (pull and query only).
+- **Regular users** must match a user in `web_users` and can pull and upload.
 - **No credentials** → connection is rejected with "authentication required".
 
 #### Enabling Web API Auth
@@ -111,19 +113,16 @@ require_auth = true
 All `/api/*` routes will then require HTTP Basic Auth. Credentials are
 checked against the `web_users` table.
 
-#### Default Admin User
+#### Creating a User
 
-When `require_auth = true` and no users exist yet, Lumen automatically creates
-a default user on startup:
+Create a regular user, or update an existing user's password, with the CLI:
 
-```
-Username: admin
-Password: admin
+```bash
+./lumen -c config.toml user create <username> <password>
 ```
 
-**Change this password immediately** by updating the `password_hash` column
-in `web_users`, or use `upsert_web_user` to overwrite it. A warning is
-printed to the terminal on first run.
+The reserved username `guest` cannot be created or assigned a password. Lumen
+no longer creates a default `admin/admin` account automatically.
 
 ### Configuring TLS
 
@@ -145,6 +144,12 @@ openssl x509 -in lumen_crt.pem -out hexrays.crt
 
 No attempt is made to merge function data - this may cause a situation where metadata is inconsistent.
 Instead, the metadata with the highest calculated score is returned to the user.
+
+---
+
+## API
+
+[API](./API.md)
 
 ---
 

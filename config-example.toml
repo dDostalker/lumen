@@ -38,6 +38,7 @@ path = "lumen.db"
 bind_addr = "0.0.0.0:8082"
 # Set to true to require HTTP Basic Auth for the web API.
 # Users and hashed passwords are stored in the `web_users` database table.
-# Use a tool or script to add users with `INSERT INTO web_users (username, password_hash) ...`
-# or use the Database::upsert_web_user method.
+# Create or update a regular user with:
+# lumen -c config.toml user create <username> <password>
+# The reserved guest username accepts any password and is read-only.
 require_auth = false

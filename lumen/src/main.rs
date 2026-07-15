@@ -5,7 +5,7 @@
 #![warn(unused_crate_dependencies)]
 #![deny(clippy::all)]
 
-use clap::Arg;
+use clap::{Arg, Command, builder::NonEmptyStringValueParser};
 use log::*;
 use server::do_lumen;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 mod server;
 mod web;
 
-use common::config;
+use common::{config, db::Database};
 
 fn setup_logger() {
     pretty_env_logger::formatted_timed_builder()
@@ -111,24 +111,61 @@ fn persist_lumina_tls_user_env() -> Result<String, std::io::Error> {
 #[tokio::main]
 async fn main() {
     setup_logger();
-    ensure_lumina_tls_disabled();
-    let matches = clap::Command::new("lumen")
+    let matches = Command::new("lumen")
         .version(env!("CARGO_PKG_VERSION"))
         .about("lumen is a private Lumina server for IDA.\nVisit https://github.com/dDostalker/lumen/ for updates.")
         .arg(
             Arg::new("config")
                 .short('c')
+                .long("config")
+                .global(true)
                 .default_value("config.toml")
                 .help("Configuration file path")
         )
+        .subcommand(
+            Command::new("user")
+                .about("Manage users that can pull and upload metadata")
+                .subcommand_required(true)
+                .subcommand(
+                    Command::new("create")
+                        .about("Create a user or update an existing user's password")
+                        .arg(
+                            Arg::new("username")
+                                .required(true)
+                                .value_parser(NonEmptyStringValueParser::new()),
+                        )
+                        .arg(
+                            Arg::new("password")
+                                .required(true)
+                                .value_parser(NonEmptyStringValueParser::new()),
+                        ),
+                ),
+        )
         .get_matches();
 
-    let config = {
-        config::load_config(
-            std::fs::File::open(matches.get_one::<String>("config").unwrap())
-                .expect("failed to read config"),
-        )
-    };
+    let config = config::load_config(
+        std::fs::File::open(matches.get_one::<String>("config").unwrap())
+            .expect("failed to read config"),
+    );
+
+    if let Some(("user", user_matches)) = matches.subcommand()
+        && let Some(("create", create_matches)) = user_matches.subcommand()
+    {
+        let username = create_matches.get_one::<String>("username").unwrap();
+        let password = create_matches.get_one::<String>("password").unwrap();
+        let db = Database::open(&config.database).await.unwrap_or_else(|err| {
+            error!("failed to open database: {err}");
+            std::process::exit(1);
+        });
+        db.upsert_web_user(username, password).await.unwrap_or_else(|err| {
+            error!("failed to create user: {err}");
+            std::process::exit(1);
+        });
+        info!("user '{username}' created or updated");
+        return;
+    }
+
+    ensure_lumina_tls_disabled();
     let config = Arc::new(config);
 
     do_lumen(config).await;

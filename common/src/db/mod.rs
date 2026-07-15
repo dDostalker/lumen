@@ -5,12 +5,16 @@ use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
 use turso::{Builder, Connection, Value, params_from_iter};
 
-pub mod schema;
-
 /// Maximum number of host parameters per statement. SQLite-compatible engines
 /// usually cap this around 999 / 32766. We pick a conservative value that fits
 /// the per-row column count used in bulk inserts.
 const SQLITE_MAX_VARS: usize = 900;
+
+pub const GUEST_USERNAME: &str = "guest";
+
+pub fn is_guest_user(username: &str) -> bool {
+    username == GUEST_USERNAME
+}
 
 pub struct Database {
     conn: Connection,
@@ -312,7 +316,7 @@ impl Database {
                 let mut params: Vec<Value> = Vec::with_capacity(sub.len() + 1);
                 params.push(Value::Integer(db_id as i64));
                 for f in sub {
-                    params.push(Value::Blob(f.hash.to_vec()));
+                    params.push(Value::Blob(f.func_hash.to_vec()));
                 }
 
                 let mut rows = self.conn.query(&sql, params_from_iter(params)).await?;
@@ -347,7 +351,7 @@ impl Database {
             for (func, &score) in func_chunk.iter().zip(score_chunk.iter()) {
                 params.push(Value::Text(func.name.to_string()));
                 params.push(Value::Integer(func.func_len as i64));
-                params.push(Value::Blob(func.hash.to_vec()));
+                params.push(Value::Blob(func.func_hash.to_vec()));
                 params.push(Value::Blob(func.func_data.to_vec()));
                 params.push(Value::Integer(score as i64));
                 params.push(Value::Integer(db_id as i64));
@@ -357,7 +361,7 @@ impl Database {
             self.conn.execute(&sql, params_from_iter(params)).await?;
 
             for func in func_chunk {
-                is_new.push(!existing.contains(func.hash));
+                is_new.push(!existing.contains(func.func_hash));
             }
         }
 
@@ -480,6 +484,10 @@ impl Database {
     pub async fn verify_web_user(
         &self, username: &str, password: &str,
     ) -> Result<bool, anyhow::Error> {
+        if is_guest_user(username) {
+            return Ok(true);
+        }
+
         let mut rows = self
             .conn
             .query(
@@ -530,6 +538,10 @@ impl Database {
     pub async fn upsert_web_user(
         &self, username: &str, password: &str,
     ) -> Result<(), anyhow::Error> {
+        if is_guest_user(username) {
+            anyhow::bail!("'guest' is reserved for passwordless read-only access");
+        }
+
         let password_hash = Self::hash_password(password);
         self.conn
             .execute(

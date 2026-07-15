@@ -133,8 +133,12 @@ pub fn parse_metadata(mut data: &[u8]) -> Result<Vec<FunctionMetadata<'_>>, crat
         }
 
         match chunk.code {
-            1 => {}, // TODO: parse typeinfo
-            2 => {}, // nop
+            1 => {
+                // Type Info， which saved in metadata
+            },
+            2 => {
+                // nop
+            },
             3 | 4 => {
                 // function comments
                 let is_repeatable = chunk.code == 4;

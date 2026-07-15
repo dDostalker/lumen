@@ -6,7 +6,7 @@ use common::{
     SharedState, SharedState_,
     async_drop::AsyncDropper,
     config::{Config, Ignore},
-    db::Database,
+    db::{Database, is_guest_user},
     make_pretty_hex, md,
     metrics::LuminaVersion,
     rpc::{self, Error, HelloResult, RpcFail, RpcHello, RpcMessage},
@@ -22,7 +22,7 @@ use tokio::{
 use crate::web;
 
 async fn handle_transaction<'a, S: AsyncRead + AsyncWrite + Unpin>(
-    state: &SharedState, user: &'a RpcHello<'a>, mut stream: S, cmt: &Ignore,
+    state: &SharedState, user: &'a RpcHello<'a>, mut stream: S, cmt: &Ignore, can_write: bool,
 ) -> Result<(), Error> {
     let db = &state.db;
     let server_name = state.server_name.as_str();
@@ -120,6 +120,16 @@ async fn handle_transaction<'a, S: AsyncRead + AsyncWrite + Unpin>(
             .await?;
         },
         RpcMessage::PushMetadata(mds) => {
+            if !can_write {
+                RpcMessage::Fail(RpcFail {
+                    code: 2,
+                    message: &format!("{server_name}: guest access is read-only."),
+                })
+                .async_write(&mut stream)
+                .await?;
+                return Ok(());
+            }
+
             // parse the function's metadata
             let start = Instant::now();
             let scores: Vec<u32> = mds.funcs.iter().map(|f| md::get_score(f, cmt)).collect();
@@ -152,6 +162,16 @@ async fn handle_transaction<'a, S: AsyncRead + AsyncWrite + Unpin>(
                 .await?;
         },
         RpcMessage::DelHistory(req) => {
+            if !can_write {
+                RpcMessage::Fail(RpcFail {
+                    code: 2,
+                    message: &format!("{server_name}: guest access is read-only."),
+                })
+                .async_write(&mut stream)
+                .await?;
+                return Ok(());
+            }
+
             let is_delete_allowed = state.config.lumina.allow_deletes.unwrap_or(false);
             if !is_delete_allowed {
                 RpcMessage::Fail(rpc::RpcFail {
@@ -287,9 +307,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(
         .get_or_create(&LuminaVersion { protocol_version: hello.protocol_version })
         .inc();
 
-    if let Some(ref creds) = creds {
+    let can_write = if let Some(ref creds) = creds {
         match state.db.verify_web_user(creds.username, creds.password).await {
-            Ok(true) => {},
+            Ok(true) => !is_guest_user(creds.username),
             Ok(false) | Err(_) => {
                 rpc::RpcMessage::Fail(rpc::RpcFail {
                     code: 1,
@@ -308,7 +328,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(
         .async_write(&mut stream)
         .await?;
         return Ok(());
-    }
+    };
 
     let resp = match hello.protocol_version {
         0..=4 => rpc::RpcMessage::Ok(()),
@@ -317,7 +337,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(
         5.. => {
             let mut features = 0;
 
-            if state.config.lumina.allow_deletes.unwrap_or(false) {
+            if can_write && state.config.lumina.allow_deletes.unwrap_or(false) {
                 features |= 0x02;
             }
 
@@ -327,7 +347,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(
     resp.async_write(&mut stream).await?;
 
     loop {
-        handle_transaction(state, &hello, &mut stream, cmt).await?;
+        handle_transaction(state, &hello, &mut stream, cmt, can_write).await?;
     }
 }
 
@@ -460,22 +480,6 @@ pub(crate) async fn do_lumen(config: Arc<Config>) {
 
     let server_name = config.lumina.server_name.clone().unwrap_or_else(|| String::from("lumen"));
     let cmt = config.ignore.clone();
-
-    // If web API auth is enabled but no users exist, create a default admin user.
-    let require_web_auth =
-        config.api_server.as_ref().and_then(|ws| ws.require_auth).unwrap_or(false);
-    if require_web_auth && !db.has_web_users().await.unwrap_or(false) {
-        let default_user = "admin";
-        let default_pass = "admin";
-        db.upsert_web_user(default_user, default_pass).await.unwrap_or_else(|e| {
-            error!("failed to create default web user: {}", e);
-        });
-        warn!(
-            "No web users found! Created default user '{}' with password '{}'. \
-             Please change the password immediately.",
-            default_user, default_pass
-        );
-    }
 
     let state = Arc::new(SharedState_ {
         db,
